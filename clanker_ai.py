@@ -1,6 +1,7 @@
 import requests
 import json
 import pyttsx3
+import serial
 from scripts_map import SCRIPTS
 
 OLLAMA_SERVER = "http://192.168.0.22:11434"
@@ -19,6 +20,7 @@ SYSTEM_PROMPT = f"""
     If no action applies, use {{ "action": "none" }}
     """
 
+ser = serial.Serial(port="/dev/ttyACM0", baudrate=9600, timeout=1)  # adjust port/baudrate
 
 def trim_history():
     global conversation_history
@@ -27,6 +29,12 @@ def trim_history():
 
 
 def query_ollama(user_input):
+    # --- send wakeup if serial is available ---
+    if ser and ser.is_open:
+        ser.write(b"wakeup\n")
+    else:
+        print("⚠️ Serial not open, skipping wakeup")
+
     conversation_history.append({"role": "user", "content": user_input})
 
     trim_history()
@@ -74,9 +82,12 @@ def speak(text):
 
 if __name__ == "__main__":
     engine = pyttsx3.init()
-    while True:
-        user_input = input("You: ")
-        if user_input.lower() in ["quit", "exit"]:
-            break
-        reply = query_ollama(user_input)
-        handle_response(reply)
+    try:
+        while True:
+            user_input = input("You: ")
+            if user_input.lower() in ["quit", "exit"]:
+                break
+            reply = query_ollama(user_input)
+            handle_response(reply)
+    finally:
+        ser.close()
