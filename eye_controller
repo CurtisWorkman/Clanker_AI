@@ -1,0 +1,171 @@
+import time
+import random
+import threading
+from adafruit_pca9685 import PCA9685
+from board import SCL, SDA
+import busio
+
+class EyeController:
+    SERVOMIN = 140
+    SERVOMAX = 520
+
+    # States
+    DORMANT = "DORMANT"   # eyes closed, asleep
+    AWAKE = "AWAKE"       # eyes open, idle
+    WAKING = "WAKING"     # waking up animation
+    SLEEPING = "SLEEPING" # going to sleep animation
+
+    def __init__(self, awake_timeout=30_000):
+        # Setup I2C + PCA9685
+        i2c = busio.I2C(SCL, SDA)
+        self.pwm = PCA9685(i2c)
+        self.pwm.frequency = 60
+
+        # State machine
+        self.state = self.DORMANT
+        self.desired_state = self.DORMANT
+
+        # Timers
+        self.previous_blink = 0
+        self.blink_interval = random.randint(2000, 6000)
+        self.loop_timer = 0
+        self.awake_timeout = awake_timeout
+        self.last_awake_time = 0  # timestamp when state was set to awake
+
+        # Servo positions
+        self.xval = 500
+        self.yval = 500
+        self.trimval = 500
+        self.update_pulses()
+
+        # Thread
+        self._running = False
+        self._thread = None
+
+    # --- Helpers ---
+    def constrain(self, val, min_val, max_val):
+        return max(min_val, min(max_val, val))
+
+    def setPWM(self, channel, value):
+        value = self.constrain(value, self.SERVOMIN, self.SERVOMAX)
+        self.pwm.channels[channel].duty_cycle = int(value / 4096 * 0xFFFF)
+
+    def update_pulses(self):
+        trimval = self.trimval
+        self.uplidpulse = self.constrain(280, 400, int((400 - 280) * self.yval / 1023 + 280) - (trimval - 40))
+        self.altuplidpulse = 680 - self.uplidpulse
+        self.lolidpulse = self.constrain(280, 400, int((410 - 280) * self.yval / 1023 + 280) + (trimval // 2))
+        self.altlolidpulse = 680 - self.lolidpulse
+
+    # --- Animations ---
+    def blink(self):
+        self.update_pulses()
+        # close eyelids
+        self.setPWM(2, 500)
+        self.setPWM(3, 240)
+        self.setPWM(4, 240)
+        self.setPWM(5, 500)
+        time.sleep(0.08)
+        # open eyelids
+        self.setPWM(2, self.uplidpulse)
+        self.setPWM(3, self.lolidpulse)
+        self.setPWM(4, self.altuplidpulse)
+        self.setPWM(5, self.altlolidpulse)
+
+    def _wakeup_sequence(self):
+        # Full wakeup animation from your Arduino code
+        self.xval = 500
+        self.yval = 500
+        self.trimval = 650
+        self.update_pulses()
+
+        lexpulse = int((220 - 440) * self.xval / 1023 + 440)
+        leypulse = int((250 - 500) * self.yval / 1023 + 500)
+
+        self.setPWM(0, lexpulse)
+        self.setPWM(1, leypulse)
+        self.setPWM(2, self.uplidpulse)
+        self.setPWM(3, self.lolidpulse)
+        self.setPWM(4, self.altuplidpulse)
+        self.setPWM(5, self.altlolidpulse)
+
+        time.sleep(0.1)
+        self.blink()
+        time.sleep(0.5)
+        self.blink()
+        time.sleep(0.5)
+
+        self.setPWM(0, 450)
+        time.sleep(0.8)
+        self.setPWM(0, 220)
+        time.sleep(1.0)
+        self.setPWM(0, 330)
+        time.sleep(1.0)
+
+        self.blink()
+        time.sleep(0.2)
+        self.blink()
+
+    def _sleep_sequence(self):
+        self.setPWM(0, 330)
+        for i in range(1, 51):
+            a = i / 50.0
+            self.setPWM(2, int(self.uplidpulse + (400 - self.uplidpulse) * a))
+            self.setPWM(3, int(self.lolidpulse + (240 - self.lolidpulse) * a))
+            self.setPWM(4, int(self.altuplidpulse + (240 - self.altuplidpulse) * a))
+            self.setPWM(5, int(self.altlolidpulse + (400 - self.altlolidpulse) * a))
+            self.setPWM(1, 400 + i)
+            time.sleep(0.04)
+        self.setPWM(2, 460)
+        self.setPWM(3, 240)
+        self.setPWM(4, 240)
+        self.setPWM(5, 460)
+
+    # --- Thread loop ---
+    def _loop(self):
+        while self._running:
+            # Handle state transitions
+            if self.state != self.desired_state:
+                if self.desired_state == self.AWAKE:
+                    self._wakeup_sequence()
+                    self.state = self.AWAKE
+                elif self.desired_state == self.DORMANT:
+                    self._sleep_sequence()
+                    self.state = self.DORMANT
+
+            # Automatic idle behavior when awake
+            if self.state == self.AWAKE:
+                now = time.monotonic() * 1000
+                if now - self.previous_blink >= self.blink_interval:
+                    self.previous_blink = now
+                    self.blink()
+                    self.blink_interval = random.randint(2000, 6000)
+                if now - self.loop_timer >= 2500:
+                    self.loop_timer = now
+                    newX = random.randint(220, 440)
+                    self.setPWM(0, newX)
+                    time.sleep(0.3)
+                # Check inactivity
+                if now - self.last_awake_time > self.awake_timeout:
+                    self.desired_state = self.DORMANT
+
+            time.sleep(0.05)
+
+    # --- Public interface ---
+    def set_state(self, new_state):
+        """Change desired state (DORMANT or AWAKE). Thread handles animation."""
+        self.desired_state = new_state
+        if new_state == self.AWAKE:
+            self.last_awake_time = time.monotonic() * 1000
+
+    def start(self):
+        if not self._running:
+            self._running = True
+            self._thread = threading.Thread(target=self._loop, daemon=True)
+            self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._thread:
+            self._thread.join()
+            self._thread = None
